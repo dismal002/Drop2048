@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -105,8 +106,6 @@ final class SoundFx {
         WavEffect(Context ctx, SoundPool fallbackPool, int res) {
             this.fallbackPool = fallbackPool;
             this.fallbackId = fallbackPool == null ? 0 : fallbackPool.load(ctx, res, 1);
-            short[] pcm;
-            int rate = 22050;
             try {
                 byte[] bytes;
                 try (InputStream in = ctx.getResources().openRawResource(res)) {
@@ -116,48 +115,112 @@ final class SoundFx {
                     while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
                     bytes = out.toByteArray();
                 }
-                int p = 12;
-                while (p + 8 <= bytes.length) {
-                    String id = new String(bytes, p, 4, StandardCharsets.US_ASCII);
-                    int len = le32(bytes, p + 4);
-                    if ("fmt ".equals(id) && p + 16 <= bytes.length) {
-                        rate = le32(bytes, p + 12);
-                    } else if ("data".equals(id)) {
-                        int count = Math.min(len, bytes.length - (p + 8)) / 2;
-                        if (rate <= 0) rate = 22050;
-                        // Pad very short cues so a static buffer is always accepted by the device.
-                        int min = rate / 10;
-                        pcm = new short[Math.max(count, min)];
-                        for (int i = 0; i < count; i++) {
-                            pcm[i] = (short) (((bytes[p + 9 + i * 2] & 0xFF) << 8) | (bytes[p + 8 + i * 2] & 0xFF));
-                        }
-                        AudioAttributes attrs = new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_GAME)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .build();
-                        AudioFormat fmt = new AudioFormat.Builder()
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .setSampleRate(rate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                .build();
-                        for (int i = 0; i < VOICES; i++) {
-                            try {
-                                AudioTrack t = new AudioTrack(attrs, fmt, pcm.length * 2,
-                                        AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE);
-                                t.write(pcm, 0, pcm.length);
-                                t.setVolume(1f);
-                                tracks[i] = t;
-                            } catch (RuntimeException ex) {
-                                break;
-                            }
-                        }
-                        return;
+                Clip clip = readWav(bytes);
+                if (clip == null) return; // unknown encoding: the SoundPool voice handles it
+                short[] pcm = clip.pcm;
+                int rate = clip.rate;
+                // Pad very short cues so a static buffer is always accepted by the device.
+                int min = Math.max(1, rate / 10);
+                if (pcm.length < min) pcm = Arrays.copyOf(pcm, min);
+                AudioAttributes attrs = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_GAME)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build();
+                AudioFormat fmt = new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(rate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build();
+                for (int i = 0; i < VOICES; i++) {
+                    try {
+                        AudioTrack t = new AudioTrack(attrs, fmt, pcm.length * 2,
+                                AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE);
+                        t.write(pcm, 0, pcm.length);
+                        t.setVolume(1f);
+                        tracks[i] = t;
+                    } catch (RuntimeException ex) {
+                        break;
                     }
-                    p += 8 + len + (len & 1);
                 }
             } catch (IOException | RuntimeException ignored) {
                 // fall back to SoundPool below
             }
+        }
+
+        /** Decoded mono 16-bit PCM plus the source sample rate. */
+        private static final class Clip {
+            final short[] pcm;
+            final int rate;
+            Clip(short[] pcm, int rate) { this.pcm = pcm; this.rate = rate; }
+        }
+
+        /**
+         * Reads a RIFF/WAVE file and converts it to mono 16-bit PCM at its own sample rate.
+         * Handles 8-bit unsigned, 16/24/32-bit signed, 32-bit float and WAVE_FORMAT_EXTENSIBLE.
+         */
+        private static Clip readWav(byte[] b) {
+            if (b.length < 12 || !"RIFF".equals(tag(b, 0)) || !"WAVE".equals(tag(b, 8))) return null;
+            int fmt = -1, fmtLen = 0, data = -1, dataLen = 0;
+            int p = 12;
+            while (p + 8 <= b.length) {
+                String id = tag(b, p);
+                int len = le32(b, p + 4);
+                int body = p + 8;
+                if ("fmt ".equals(id)) {
+                    fmt = body;
+                    fmtLen = len;
+                } else if ("data".equals(id)) {
+                    data = body;
+                    dataLen = len <= 0 ? b.length - body : Math.min(len, b.length - body);
+                    break;
+                }
+                if (len < 0) return null;
+                p = body + len + (len & 1);
+            }
+            if (fmt < 0 || data < 0 || fmtLen < 16) return null;
+            int format = le16(b, fmt);
+            int channels = le16(b, fmt + 2);
+            int rate = le32(b, fmt + 4);
+            int bits = le16(b, fmt + 14);
+            if (format == 0xFFFE && fmtLen >= 40) format = le16(b, fmt + 24); // WAVE_FORMAT_EXTENSIBLE
+            if (format != 1 && format != 3) return null;                       // PCM or IEEE float only
+            if (channels < 1 || channels > 8) return null;
+            int bytesPer = bits / 8;
+            if (bytesPer != 1 && bytesPer != 2 && bytesPer != 3 && bytesPer != 4) return null;
+            if (rate <= 0) return null;
+            int frames = dataLen / (bytesPer * channels);
+            if (frames <= 0) return null;
+            short[] pcm = new short[frames];
+            for (int i = 0; i < frames; i++) {
+                int sum = 0;
+                for (int c = 0; c < channels; c++) {
+                    int o = data + (i * channels + c) * bytesPer;
+                    if (format == 3) {                    // 32-bit float
+                        float v = Float.intBitsToFloat(le32(b, o));
+                        if (v > 1f) v = 1f;
+                        if (v < -1f) v = -1f;
+                        sum += Math.round(v * 32767f);
+                    } else if (bytesPer == 1) {           // 8-bit unsigned
+                        sum += ((b[o] & 0xFF) - 128) << 8;
+                    } else if (bytesPer == 2) {           // 16-bit signed
+                        sum += (short) le16(b, o);
+                    } else if (bytesPer == 3) {           // 24-bit signed
+                        sum += ((b[o] & 0xFF) | ((b[o + 1] & 0xFF) << 8) | (b[o + 2] << 16)) >> 8;
+                    } else {                              // 32-bit signed
+                        sum += le32(b, o) >> 16;
+                    }
+                }
+                pcm[i] = (short) (sum / channels);
+            }
+            return new Clip(pcm, rate);
+        }
+
+        private static String tag(byte[] b, int o) {
+            return new String(b, o, 4, StandardCharsets.US_ASCII);
+        }
+
+        private static int le16(byte[] b, int o) {
+            return (b[o] & 255) | ((b[o + 1] & 255) << 8);
         }
 
         void play() {
