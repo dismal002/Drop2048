@@ -1,6 +1,6 @@
 # Drop 2048
 
-Fun 2048 drop merge game with no ads and no tracking where you ar'nt the product.
+Fun 2048 drop merge game with no ads and no tracking where you aren't the product.
 
 ## Build
 
